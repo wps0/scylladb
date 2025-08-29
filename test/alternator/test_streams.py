@@ -663,6 +663,16 @@ def fetch_more(dynamodbstreams, iterators, output):
 # Note that the order of events is only guaranteed (and therefore compared)
 # inside a single partition.
 def compare_events(expected_events, output, mode):
+    print('expected_events')
+    for e in expected_events:
+        print('   ', e)
+    print('output:')
+    for e in output:
+        del e['eventID']
+        del e['dynamodb']['ApproximateCreationDateTime']
+        del e['eventSource']
+        del e['dynamodb']['SequenceNumber']
+        print('   ', e)
     # The order of expected_events is only meaningful inside a partition, so
     # let's convert it into a map indexed by partition key.
     expected_events_map = {}
@@ -1409,11 +1419,11 @@ def test_streams_1_keys_only(test_table_ss_keys_only, dynamodbstreams):
 def test_streams_1_new_image(test_table_ss_new_image, dynamodbstreams):
     do_test(test_table_ss_new_image, dynamodbstreams, do_updates_1, 'NEW_IMAGE')
 
-@pytest.mark.xfail(reason="Currently fails - because of multiple issues listed above")
+# @pytest.mark.xfail(reason="Currently fails - because of multiple issues listed above")
 def test_streams_1_old_image(test_table_ss_old_image, dynamodbstreams):
     do_test(test_table_ss_old_image, dynamodbstreams, do_updates_1, 'OLD_IMAGE')
 
-@pytest.mark.xfail(reason="Currently fails - because of multiple issues listed above")
+# @pytest.mark.xfail(reason="Currently fails - because of multiple issues listed above")
 def test_streams_1_new_and_old_images(test_table_ss_new_and_old_images, dynamodbstreams):
     do_test(test_table_ss_new_and_old_images, dynamodbstreams, do_updates_1, 'NEW_AND_OLD_IMAGES')
 
