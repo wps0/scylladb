@@ -14,7 +14,7 @@ import pytest
 from boto3.dynamodb.types import TypeDeserializer
 from botocore.exceptions import ClientError
 
-from test.alternator.util import unique_table_name, create_test_table, new_test_table, random_string, freeze, list_tables
+from test.alternator.util import scylla_config_temporary, unique_table_name, create_test_table, new_test_table, random_string, freeze, list_tables
 
 # All tests in this file are expected to fail with tablets due to #16317.
 # To ensure that Alternator Streams is still being tested, instead of
@@ -796,8 +796,7 @@ def test_streams_putitem_keys_only(test_table_ss_keys_only, dynamodbstreams):
     def do_updates(table, p, c):
         events = []
         table.put_item(Item={'p': p, 'c': c, 'x': 2})
-        # TODO: change to 'INSERT' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p, 'c': c}, None, {'p': p, 'c': c, 'x': 2}])
+        events.append(['INSERT', {'p': p, 'c': c}, None, {'p': p, 'c': c, 'x': 2}])
         return events
     do_test(test_table_ss_keys_only, dynamodbstreams, do_updates, 'KEYS_ONLY')
 
@@ -805,11 +804,9 @@ def test_streams_putitem_new_item_overrides_old_lsi(test_table_sss_new_and_old_i
     def do_updates(table, p, c):
         events = []
         table.put_item(Item={'p': p, 'c': c, 'a': '1'})
-        # TODO: change to 'INSERT' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p, 'c': c}, None, {'p': p, 'c': c, 'a': '1'}])
+        events.append(['INSERT', {'p': p, 'c': c}, None, {'p': p, 'c': c, 'a': '1'}])
         table.put_item(Item={'p': p, 'c': c})
-        # TODO: change to 'MODIFY' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p, 'c': c}, {'p': p, 'c': c, 'a': '1'}, {'p': p, 'c': c}])
+        events.append(['MODIFY', {'p': p, 'c': c}, {'p': p, 'c': c, 'a': '1'}, {'p': p, 'c': c}])
         return events
     do_test(test_table_sss_new_and_old_images_lsi, dynamodbstreams, do_updates, 'NEW_AND_OLD_IMAGES')
 
@@ -817,11 +814,9 @@ def test_streams_putitem_new_item_overrides_old(test_table_ss_new_and_old_images
     def do_updates(table, p, c):
         events = []
         table.put_item(Item={'p': p, 'c': c, 'a': 1})
-        # TODO: change to 'INSERT' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p, 'c': c}, None, {'p': p, 'c': c, 'a': 1}])
+        events.append(['INSERT', {'p': p, 'c': c}, None, {'p': p, 'c': c, 'a': 1}])
         table.put_item(Item={'p': p, 'c': c})
-        # TODO: change to 'MODIFY' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p, 'c': c}, {'p': p, 'c': c, 'a': 1}, {'p': p, 'c': c}])
+        events.append(['MODIFY', {'p': p, 'c': c}, {'p': p, 'c': c, 'a': 1}, {'p': p, 'c': c}])
         return events
     do_test(test_table_ss_new_and_old_images, dynamodbstreams, do_updates, 'NEW_AND_OLD_IMAGES')
 
@@ -829,14 +824,11 @@ def test_streams_putitem_new_items_override_old(test_table_ss_new_and_old_images
     def do_updates(table, p, c):
         events = []
         table.put_item(Item={'p': p, 'c': c, 'a': 1})
-        # TODO: change to 'INSERT' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p, 'c': c}, None, {'p': p, 'c': c, 'a': 1}])
+        events.append(['INSERT', {'p': p, 'c': c}, None, {'p': p, 'c': c, 'a': 1}])
         table.put_item(Item={'p': p, 'c': c, 'b': 2})
-        # TODO: change to 'MODIFY' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p, 'c': c}, {'p': p, 'c': c, 'a': 1}, {'p': p, 'c': c, 'b': 2}])
+        events.append(['MODIFY', {'p': p, 'c': c}, {'p': p, 'c': c, 'a': 1}, {'p': p, 'c': c, 'b': 2}])
         table.put_item(Item={'p': p, 'c': c, 'a': 3, 'b': 4})
-        # TODO: change to 'MODIFY' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p, 'c': c}, {'p': p, 'c': c, 'b': 2}, {'p': p, 'c': c, 'a': 3, 'b': 4}])
+        events.append(['MODIFY', {'p': p, 'c': c}, {'p': p, 'c': c, 'b': 2}, {'p': p, 'c': c, 'a': 3, 'b': 4}])
         return events
     do_test(test_table_ss_new_and_old_images, dynamodbstreams, do_updates, 'NEW_AND_OLD_IMAGES')
 
@@ -845,8 +837,7 @@ def test_streams_putitem_no_ck_keys_only(test_table_s_no_ck_keys_only, dynamodbs
     def do_updates(table, p, _):
         events = []
         table.put_item(Item={'p': p, 'x': 2})
-        # TODO: change to 'INSERT' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p}, None, {'p': p, 'x': 2}])
+        events.append(['INSERT', {'p': p}, None, {'p': p, 'x': 2}])
         return events
     do_test(test_table_s_no_ck_keys_only, dynamodbstreams, do_updates, 'KEYS_ONLY')
 
@@ -854,11 +845,9 @@ def test_streams_putitem_no_ck_new_item_overrides_old(test_table_s_no_ck_new_and
     def do_updates(table, p, _):
         events = []
         table.put_item(Item={'p': p, 'a': 1})
-        # TODO: change to 'INSERT' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p}, None, {'p': p, 'a': 1}])
+        events.append(['INSERT', {'p': p}, None, {'p': p, 'a': 1}])
         table.put_item(Item={'p': p})
-        # TODO: change to 'MODIFY' when #6918 is fixed
-        events.append([['INSERT', 'MODIFY'], {'p': p}, {'p': p, 'a': 1}, {'p': p}])
+        events.append(['MODIFY', {'p': p}, {'p': p, 'a': 1}, {'p': p}])
         return events
     do_test(test_table_s_no_ck_new_and_old_images, dynamodbstreams, do_updates, 'NEW_AND_OLD_IMAGES')
 
@@ -879,6 +868,22 @@ def test_streams_putitem_no_ck_new_items_override_old_2(test_table_s_no_ck_new_a
         events.append([['INSERT', 'MODIFY'], {'p': p}, {'p': p, 'b': 2}, {'p': p, 'a': 3, 'b': 4}])
         return events
     do_test(test_table_s_no_ck_new_and_old_images, dynamodbstreams, do_updates, 'NEW_AND_OLD_IMAGES')
+
+def test_streams_putitem_delete_put_new_and_old_images(dynamodb, test_table_ss_new_and_old_images, dynamodbstreams):
+    def do_updates(table, p, c):
+        events = []
+        # a first put_item appears as an INSERT event. Note also empty old_image.
+        table.put_item(Item={'p': p, 'c': c, 'x': 2})
+        events.append(['INSERT', {'p': p, 'c': c}, None, {'p': p, 'c': c, 'x': 2}])
+        # deleting an item appears as a REMOVE event. Note no new_image at all, but there is an old_image.
+        table.delete_item(Key={'p': p, 'c': c})
+        events.append(['REMOVE', {'p': p, 'c': c}, {'p': p, 'c': c, 'x': 2}, None])
+        # a second put_item of the *same* key and different value, appears as an INSERT event
+        table.put_item(Item={'p': p, 'c': c, 'y': 3})
+        events.append(['INSERT', {'p': p, 'c': c}, None, {'p': p, 'c': c, 'y': 3}])
+        return events
+    with scylla_config_temporary(dynamodb, 'alternator_force_read_before_write', 'true'):
+        do_test(test_table_ss_new_and_old_images, dynamodbstreams, do_updates, 'NEW_AND_OLD_IMAGES')
 
 # Test a single UpdateItem. Should result in a single INSERT event.
 # Currently fails because Alternator generates a MODIFY event even though
