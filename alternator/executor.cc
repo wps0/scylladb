@@ -2136,7 +2136,7 @@ public:
     put_or_delete_item(const rjson::value& item, schema_ptr schema, put_item, std::unordered_map<bytes, std::string> key_attributes);
     // put_or_delete_item doesn't keep a reference to schema (so it can be
     // moved between shards for LWT) so it needs to be given again to build():
-    mutation build(schema_ptr schema, api::timestamp_type ts) const;
+    mutation build(schema_ptr schema, api::timestamp_type ts, std::unique_ptr<rjson::value> previous_item, bool performed) const;
     const partition_key& pk() const { return _pk; }
     const clustering_key& ck() const { return _ck; }
     uint64_t length_in_bytes() const noexcept {
@@ -2280,7 +2280,7 @@ put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr sche
     }
 }
 
-mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts) const {
+mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, std::unique_ptr<rjson::value> previous_item, bool performed) const {
     mutation m(schema, _pk);
     // If there's no clustering key, a tombstone should be created directly
     // on a partition, not on a clustering row - otherwise it will look like
@@ -2312,8 +2312,13 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts) co
         auto serialized_map = attrs_collector.to_mut().serialize(*attrs_type());
         row.cells().apply(attrs, std::move(serialized_map));
     }
-    // To allow creation of an item with no attributes, we need a row marker.
-    row.apply(row_marker(ts));
+    // Create the row when we don't know if the row exists (no read-before-write using LWT),
+    // or when we're guaranteed that it doesn't (LWT). This allows us to generate INSERT or
+    // MODIFY Streams mutation, depending on whether the item previously existed, for better
+    // compatibility of with DynamoDB Streams. This resolves #6918.
+    if (!performed || !previous_item) {
+        row.apply(row_marker(ts));
+    }
     // PutItem is supposed to completely replace the old item, so we need to
     // also have a tombstone removing old cells. Important points:
     // 1) Alternator's schema is dynamic, therefore we store data in a map
@@ -2442,10 +2447,10 @@ std::optional<mutation> rmw_operation::apply(foreign_ptr<lw_shared_ptr<query::re
             _consumed_capacity._total_bytes = item_length;
         }
         if (previous_item) {
-            return apply(std::make_unique<rjson::value>(std::move(*previous_item)), ts);
+            return apply(std::make_unique<rjson::value>(std::move(*previous_item)), true, ts);
         }
     }
-    return apply(std::unique_ptr<rjson::value>(), ts);
+    return apply(std::unique_ptr<rjson::value>(), true, ts);
 }
 
 rmw_operation::write_isolation rmw_operation::get_write_isolation_for_schema(schema_ptr schema) {
@@ -2579,7 +2584,7 @@ future<executor::request_return_type> rmw_operation::execute(service::storage_pr
             // a read, then a write. TODO: remove this mode entirely.
             return get_previous_item(proxy, client_state, schema(), _pk, _ck, permit, global_stats, per_table_stats, _consumed_capacity._total_bytes).then(
                     [this, &proxy, &wcu_total, trace_state, permit = std::move(permit)] (std::unique_ptr<rjson::value> previous_item) mutable {
-                std::optional<mutation> m = apply(std::move(previous_item), api::new_timestamp());
+                std::optional<mutation> m = apply(std::move(previous_item), false, api::new_timestamp());
                 if (!m) {
                     return make_ready_future<executor::request_return_type>(api_error::conditional_check_failed("The conditional request failed", std::move(_return_attributes)));
                 }
@@ -2589,7 +2594,7 @@ future<executor::request_return_type> rmw_operation::execute(service::storage_pr
             });
         }
     } else if (_write_isolation != write_isolation::LWT_ALWAYS) {
-        std::optional<mutation> m = apply(nullptr, api::new_timestamp());
+        std::optional<mutation> m = apply(nullptr, false, api::new_timestamp());
         SCYLLA_ASSERT(m); // !needs_read_before_write, so apply() did not check a condition
         return proxy.mutate(utils::chunked_vector<mutation>{std::move(*m)}, db::consistency_level::LOCAL_QUORUM, executor::default_timeout(), trace_state, std::move(permit), db::allow_per_partition_rate_limit::yes).then([this, &wcu_total] () mutable {
             return rmw_operation_return(std::move(_return_attributes), _consumed_capacity, wcu_total);
@@ -2698,7 +2703,7 @@ public:
                check_needs_read_before_write(_condition_expression) ||
                _returnvalues == returnvalues::ALL_OLD;
     }
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const override {
+    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const override {
         if (!verify_expected(_request, previous_item.get()) ||
             !verify_condition_expression(_condition_expression, previous_item.get())) {
             if (previous_item && _returnvalues_on_condition_check_failure ==
@@ -2711,11 +2716,11 @@ public:
             return {};
         }
         if (_returnvalues == returnvalues::ALL_OLD && previous_item) {
-            _return_attributes = std::move(*previous_item);
+            _return_attributes = *previous_item;
         } else {
             _return_attributes = {};
         }
-        return _mutation_builder.build(_schema, ts);
+        return _mutation_builder.build(_schema, ts, std::move(previous_item), performed_read);
     }
     virtual ~put_item_operation() = default;
 };
@@ -2797,7 +2802,7 @@ public:
                 check_needs_read_before_write(_condition_expression) ||
                 _returnvalues == returnvalues::ALL_OLD;
     }
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const override {
+    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const override {
         if (!verify_expected(_request, previous_item.get()) ||
             !verify_condition_expression(_condition_expression, previous_item.get())) {
             if (previous_item && _returnvalues_on_condition_check_failure ==
@@ -2810,14 +2815,14 @@ public:
             return {};
         }
         if (_returnvalues == returnvalues::ALL_OLD && previous_item) {
-            _return_attributes = std::move(*previous_item);
+            _return_attributes = *previous_item;
         } else {
             _return_attributes = {};
         }
         if (_consumed_capacity._total_bytes == 0) {
             _consumed_capacity._total_bytes = 1;
         }
-        return _mutation_builder.build(_schema, ts);
+        return _mutation_builder.build(_schema, ts, std::move(previous_item), performed_read);
     }
     virtual ~delete_item_operation() = default;
 };
@@ -2906,9 +2911,9 @@ public:
         for (const put_or_delete_item& mutation_builder : _mutation_builders) {
             // We assume all these builders have the same partition.
             if (ret) {
-                ret->apply(mutation_builder.build(schema, ts));
+                ret->apply(mutation_builder.build(schema, ts, nullptr, false));
             } else {
-                ret = mutation_builder.build(schema, ts);
+                ret = mutation_builder.build(schema, ts, nullptr, false);
             }
         }
         return ret;
@@ -2969,7 +2974,7 @@ static future<> do_batch_write(service::storage_proxy& proxy,
         mutations.reserve(mutation_builders.size());
         api::timestamp_type now = api::new_timestamp();
         for (auto& b : mutation_builders) {
-            mutations.push_back(b.second.build(b.first, now));
+            mutations.push_back(b.second.build(b.first, now, nullptr, false));
         }
         return proxy.mutate(std::move(mutations),
                 db::consistency_level::LOCAL_QUORUM,
@@ -3694,7 +3699,7 @@ public:
 
     update_item_operation(service::storage_proxy& proxy, rjson::value&& request);
     virtual ~update_item_operation() = default;
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const override;
+    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const override;
     bool needs_read_before_write() const;
 };
 
@@ -4020,7 +4025,7 @@ static bool hierarchy_actions(
 }
 
 std::optional<mutation>
-update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const {
+update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const {
     if (_consumed_capacity._total_bytes == 0) {
         _consumed_capacity._total_bytes = 1;
     }
