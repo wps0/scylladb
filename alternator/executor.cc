@@ -2323,6 +2323,7 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, st
     // or when we're guaranteed that it doesn't (LWT). This allows us to generate INSERT or
     // MODIFY Streams mutation, depending on whether the item previously existed, for better
     // compatibility of with DynamoDB Streams. This resolves #6918.
+    elogger.debug("performed={} previous_item={}", use_lwt, (bool) previous_item);
     if (!use_lwt || !previous_item) {
         row.apply(row_marker(ts));
     }
