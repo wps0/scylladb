@@ -2289,10 +2289,9 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, st
     const bool use_partition_tombstone = schema->clustering_key_size() == 0;
     if (!_cells) {
         // This shouldn't break consistency, as long as it's performed using
-        // lwt, because the majority of replicas take part in the read and the
-        // write, and the item is guaranteed to stay the same between the read
-        // and the write.
+        // lwt, because Scylla's Paxos guarantees linearizability.
         if (use_lwt && !previous_item) {
+            // Ignore the delete.
             return m;
         }
         if (use_partition_tombstone) {
