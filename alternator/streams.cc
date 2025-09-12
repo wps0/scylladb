@@ -796,6 +796,7 @@ struct rapidjson::internal::TypeHelper<ValueType, alternator::event_id>
     : public from_string_helper<ValueType, alternator::event_id>
 {};
 
+extern logging::logger elogger;
 namespace alternator {
     
 future<executor::request_return_type> executor::get_records(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
@@ -945,7 +946,12 @@ future<executor::request_return_type> executor::get_records(client_state& client
             }
         };
 
+        for (auto& ns : result_set->get_metadata().get_names()) {
+            elogger.trace("siema meta {}", ns->name);
+        }
+
         for (auto& row : result_set->rows()) {
+            elogger.trace("siema {}", row);
             auto op = static_cast<cdc::operation>(value_cast<op_utype>(data_type_for<op_utype>()->deserialize(*row[op_index])));
             auto ts = value_cast<utils::UUID>(data_type_for<utils::UUID>()->deserialize(*row[ts_index]));
             auto eor = row[eor_index].has_value() ? value_cast<bool>(boolean_type->deserialize(*row[eor_index])) : false;

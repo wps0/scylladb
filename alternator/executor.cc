@@ -2316,6 +2316,7 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, st
     // or when we're guaranteed that it doesn't (LWT). This allows us to generate INSERT or
     // MODIFY Streams mutation, depending on whether the item previously existed, for better
     // compatibility of with DynamoDB Streams. This resolves #6918.
+    elogger.debug("performed={} previous_item={}", performed, (bool) previous_item);
     if (!performed || !previous_item) {
         row.apply(row_marker(ts));
     }
@@ -2580,6 +2581,7 @@ future<executor::request_return_type> rmw_operation::execute(service::storage_pr
         global_stats.reads_before_write++;
         per_table_stats.reads_before_write++;
         if (_write_isolation == write_isolation::UNSAFE_RMW) {
+            elogger.trace("siema write isolation unsafe");
             // This is the old, unsafe, read before write which does first
             // a read, then a write. TODO: remove this mode entirely.
             return get_previous_item(proxy, client_state, schema(), _pk, _ck, permit, global_stats, per_table_stats, _consumed_capacity._total_bytes).then(
@@ -2594,6 +2596,7 @@ future<executor::request_return_type> rmw_operation::execute(service::storage_pr
             });
         }
     } else if (_write_isolation != write_isolation::LWT_ALWAYS) {
+        elogger.trace("siema write isolation != lwt always");
         std::optional<mutation> m = apply(nullptr, false, api::new_timestamp());
         SCYLLA_ASSERT(m); // !needs_read_before_write, so apply() did not check a condition
         return proxy.mutate(utils::chunked_vector<mutation>{std::move(*m)}, db::consistency_level::LOCAL_QUORUM, executor::default_timeout(), trace_state, std::move(permit), db::allow_per_partition_rate_limit::yes).then([this, &wcu_total] () mutable {
@@ -2603,6 +2606,7 @@ future<executor::request_return_type> rmw_operation::execute(service::storage_pr
     if (!cas_shard) {
         on_internal_error(elogger, "cas_shard is not set");
     }
+    elogger.trace("siema write isolation lwt");
     // If we're still here, we need to do this write using LWT:
     global_stats.write_using_lwt++;
     per_table_stats.write_using_lwt++;

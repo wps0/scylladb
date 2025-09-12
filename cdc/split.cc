@@ -264,6 +264,8 @@ struct extract_row_visitor {
     constexpr bool finished() const { return false; }
 };
 
+extern logging::logger elogger;
+
 struct extract_changes_visitor {
     set_of_changes _result;
 

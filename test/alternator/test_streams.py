@@ -668,11 +668,13 @@ def compare_events(expected_events, output, mode):
         print('   ', e)
     print('output:')
     for e in output:
-        del e['eventID']
-        del e['dynamodb']['ApproximateCreationDateTime']
-        del e['eventSource']
-        del e['dynamodb']['SequenceNumber']
-        print('   ', e)
+        import copy
+        x = copy.deepcopy(e)
+        del x['eventID']
+        del x['dynamodb']['ApproximateCreationDateTime']
+        del x['eventSource']
+        del x['dynamodb']['SequenceNumber']
+        print('   ', x)
     # The order of expected_events is only meaningful inside a partition, so
     # let's convert it into a map indexed by partition key.
     expected_events_map = {}
