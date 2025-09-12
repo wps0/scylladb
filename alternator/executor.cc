@@ -2280,7 +2280,7 @@ put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr sche
     }
 }
 
-mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, std::unique_ptr<rjson::value> previous_item, bool performed) const {
+mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, std::unique_ptr<rjson::value> previous_item, bool use_lwt) const {
     mutation m(schema, _pk);
     // If there's no clustering key, a tombstone should be created directly
     // on a partition, not on a clustering row - otherwise it will look like
@@ -2292,7 +2292,7 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, st
         // lwt, because the majority of replicas take part in the read and the
         // write, and the item is guaranteed to stay the same between the read
         // and the write.
-        if (performed && !previous_item) {
+        if (use_lwt && !previous_item) {
             return m;
         }
         if (use_partition_tombstone) {
@@ -2323,8 +2323,7 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, st
     // or when we're guaranteed that it doesn't (LWT). This allows us to generate INSERT or
     // MODIFY Streams mutation, depending on whether the item previously existed, for better
     // compatibility of with DynamoDB Streams. This resolves #6918.
-    elogger.debug("performed={} previous_item={}", performed, (bool) previous_item);
-    if (!performed || !previous_item) {
+    if (!use_lwt || !previous_item) {
         row.apply(row_marker(ts));
     }
     // PutItem is supposed to completely replace the old item, so we need to
