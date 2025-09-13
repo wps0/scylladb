@@ -410,6 +410,7 @@ bool cdc::options::operator==(const options& o) const {
             && _delta_mode == o._delta_mode;
 }
 
+extern logging::logger elogger;
 namespace cdc {
 
 using operation_native_type = std::underlying_type_t<operation>;
@@ -1587,6 +1588,7 @@ public:
     // TODO: is pre-image data based on query enough. We only have actual column data. Do we need
     // more details like tombstones/ttl? Probably not but keep in mind.
     void process_change(const mutation& m) override {
+        elogger.trace("siema cdc process_change {}", m);
         SCYLLA_ASSERT(_builder);
         process_change_visitor v {
             ._touched_parts = _touched_parts,
@@ -1853,15 +1855,20 @@ cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, 
                     details.was_split = true;
                     process_changes_with_splitting(m, trans, preimage, postimage);
                 } else {
+                    elogger.trace("siema generated mut NO NEED TO SPLIT");
                     tracing::trace(tr_state, "CDC: No need to split {}", m.decorated_key());
                     process_changes_without_splitting(m, trans, preimage, postimage);
                 }
                 auto [log_mut, touched_parts] = std::move(trans).finish();
+                for (auto const& m : log_mut) {
+                    elogger.trace("siema generated mut {}", m);
+                }
                 const int generated_count = log_mut.size();
                 mutations.insert(mutations.end(), std::make_move_iterator(log_mut.begin()), std::make_move_iterator(log_mut.end()));
 
                 // `m` might be invalidated at this point because of the push_back to the vector
                 tracing::trace(tr_state, "CDC: Generated {} log mutations from {}", generated_count, mutations[idx].decorated_key());
+                elogger.trace("siema END");
                 details.touched_parts.add(touched_parts);
             });
         }).then([this, tr_state, &details](utils::chunked_vector<mutation> mutations) {

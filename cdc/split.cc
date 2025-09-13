@@ -298,14 +298,18 @@ struct extract_changes_visitor {
             }
         } v;
         visit_row_cells(v);
-
+        
+        elogger.trace("-- siema cdc extract changes visitor begin ckey={}", ckey);
+        elogger.trace("siema cdc extract changes visitor marker: ttl={}, ts={}", v._marker_ttl, v._marker_ts);
         for (auto& [ts_ttl, row_update]: v._updates) {
             // It is important that changes in the resulting `set_of_changes` are listed
             // in increasing TTL order. The reason is explained in a comment in cdc/log.cc,
             // search for "#6070".
             auto [ts, ttl] = ts_ttl;
+            elogger.trace("siema cdc extract changes visitor ts={} ttl={}", ts, ttl);
 
             if (v._marker && ts == v._marker_ts && ttl == v._marker_ttl) {
+                elogger.trace("siema cdc extract... case 1");
                 _result[ts].clustered_inserts.push_back({
                         ttl,
                         ckey,
@@ -338,10 +342,14 @@ struct extract_changes_visitor {
                     //   which represents an INSERT change.
                     // - but if `nonatomic_up` only has cells, we must create a separate UPDATE change
                     //   for the cells alone.
+                    // TODO: ta logika?
                     if (nonatomic_up.t) {
+                        elogger.trace("siema cdc extract... case 1.1");
                         cr_insert.nonatomic_entries.push_back(std::move(nonatomic_up));
                     } else {
+                        elogger.trace("siema cdc extract... case 1.2");
                         if (!clustered_update_exists) {
+                            elogger.trace("siema cdc extract... case 1.2.1");
                             _result[ts].clustered_updates.push_back({
                                 ttl,
                                 ckey,
@@ -364,12 +372,14 @@ struct extract_changes_visitor {
                             // This logic takes care that b cells and c cells are put into a single change (3. above).
                             clustered_update_exists = true;
                         }
-
+                        
+                        elogger.trace("siema cdc extract... case 1.2F");
                         auto& cr_update = _result[ts].clustered_updates.back();
                         cr_update.nonatomic_entries.push_back(std::move(nonatomic_up));
                     }
                 }
             } else {
+                elogger.trace("siema cdc extract... case 2");
                 _result[ts].clustered_updates.push_back({
                         ttl,
                         ckey,
@@ -578,7 +588,9 @@ void process_changes_with_splitting(const mutation& base_mutation, change_proces
 
     const auto last_timestamp = changes.rbegin()->first;
 
+    elogger.trace("siema cdc base mutation {}", base_mutation);
     for (auto& [change_ts, btch] : changes) {
+        elogger.trace("-- siema cdc? {}", change_ts);
         const bool is_last = change_ts == last_timestamp;
         processor.begin_timestamp(change_ts, is_last);
 
