@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "cdc/log.hh"
 #include "mutation/mutation.hh"
 #include "modification_statement.hh"
 #include "cas_request.hh"
@@ -112,11 +113,11 @@ bool cas_request::applies_to() const {
     return true;
 }
 
-std::optional<mutation> cas_request::apply(foreign_ptr<lw_shared_ptr<query::result>> qr,
+std::pair<std::optional<mutation>, cdc::squash_target> cas_request::apply(foreign_ptr<lw_shared_ptr<query::result>> qr,
         const query::partition_slice& slice, api::timestamp_type ts) {
     _rows = update_parameters::build_prefetch_data(_schema, *qr, slice);
     if (applies_to()) {
-        return apply_updates(ts);
+        return {apply_updates(ts), cdc::squash_target::no_squash};
     } else {
         return {};
     }

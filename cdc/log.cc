@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <boost/bind/arg.hpp>
 #include <utility>
 #include <algorithm>
 
@@ -235,7 +236,8 @@ public:
         lowres_clock::time_point timeout,
         utils::chunked_vector<mutation>&& mutations,
         tracing::trace_state_ptr tr_state,
-        db::consistency_level write_cl
+        db::consistency_level write_cl,
+        squash_target squash_target
     );
 
     template<typename Iter>
@@ -1282,6 +1284,8 @@ struct process_change_visitor {
 
     log_mutation_builder& _builder;
 
+    const squash_target& _squash_target;
+
     /* Images-related state */
     const bool _enable_updating_state = false;
 
@@ -1333,7 +1337,16 @@ struct process_change_visitor {
             _clustering_row_states.try_emplace(ckey);
         }
 
-        _builder.set_operation(log_ck, v._cdc_op);
+        switch (_squash_target) {
+        case squash_target::insert:
+            _builder.set_operation(log_ck, operation::insert);
+            break;
+        case squash_target::update:
+            _builder.set_operation(log_ck, operation::update);
+            break;
+        default:
+            _builder.set_operation(log_ck, v._cdc_op);
+        }
         _builder.set_ttl(log_ck, v._ttl_column);
     }
 
@@ -1399,6 +1412,7 @@ private:
     schema_ptr _schema;
     dht::decorated_key _dk;
     schema_ptr _log_schema;
+    squash_target _squash_target;
 
     /**
      * #6070, #6084
@@ -1486,11 +1500,12 @@ private:
     stats::part_type_set _touched_parts;
 
 public:
-    transformer(db_context ctx, schema_ptr s, dht::decorated_key dk)
+    transformer(db_context ctx, schema_ptr s, dht::decorated_key dk, squash_target squash_target)
         : _ctx(ctx)
         , _schema(std::move(s))
         , _dk(std::move(dk))
         , _log_schema(ctx._proxy.get_db().local().find_schema(_schema->ks_name(), log_name(_schema->cf_name())))
+        , _squash_target(squash_target)
         , _clustering_row_states(0, clustering_key::hashing(*_schema), clustering_key::equality(*_schema))
     {
     }
@@ -1593,6 +1608,7 @@ public:
         process_change_visitor v {
             ._touched_parts = _touched_parts,
             ._builder = *_builder,
+            ._squash_target = _squash_target,
             ._enable_updating_state = _enable_updating_state,
             ._clustering_row_states = _clustering_row_states,
             ._static_row_state = _static_row_state,
@@ -1791,7 +1807,11 @@ transform_mutations(utils::chunked_vector<mutation>& muts, decltype(muts.size())
 } // namespace cdc
 
 future<std::tuple<utils::chunked_vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>
-cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, utils::chunked_vector<mutation>&& mutations, tracing::trace_state_ptr tr_state, db::consistency_level write_cl) {
+cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, utils::chunked_vector<mutation>&& mutations, tracing::trace_state_ptr tr_state, db::consistency_level write_cl, squash_target squash_target) {
+    if (squash_target == squash_target::ignore_cdc) {
+        return make_ready_future<std::tuple<utils::chunked_vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>();
+    }
+    SCYLLA_ASSERT(squash_target == squash_target::no_squash || mutations.size() == 1);
     // we do all this because in the case of batches, we can have mixed schemas.
     auto e = mutations.end();
     auto i = std::find_if(mutations.begin(), e, [](const mutation& m) {
@@ -1806,8 +1826,8 @@ cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, 
     mutations.reserve(2 * mutations.size());
 
     return do_with(std::move(mutations), service::query_state(service::client_state::for_internal_calls(), empty_service_permit()), operation_details{},
-            [this, tr_state = std::move(tr_state), write_cl] (utils::chunked_vector<mutation>& mutations, service::query_state& qs, operation_details& details) {
-        return transform_mutations(mutations, 1, [this, &mutations, &qs, tr_state = tr_state, &details, write_cl] (int idx) mutable {
+            [this, tr_state = std::move(tr_state), write_cl, squash_target] (utils::chunked_vector<mutation>& mutations, service::query_state& qs, operation_details& details) {
+        return transform_mutations(mutations, 1, [this, &mutations, &qs, tr_state = tr_state, &details, write_cl, squash_target] (int idx) mutable {
             auto& m = mutations[idx];
             auto s = m.schema();
 
@@ -1815,7 +1835,7 @@ cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, 
                 return make_ready_future<>();
             }
 
-            transformer trans(_ctxt, s, m.decorated_key());
+            transformer trans(_ctxt, s, m.decorated_key(), squash_target);
 
             auto f = make_ready_future<lw_shared_ptr<cql3::untyped_result_set>>(nullptr);
             if (s->cdc_options().preimage() || s->cdc_options().postimage()) {
@@ -1835,7 +1855,7 @@ cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, 
                 tracing::trace(tr_state, "CDC: Preimage not enabled for the table, not querying current value of {}", m.decorated_key());
             }
 
-            return f.then([trans = std::move(trans), &mutations, idx, tr_state, &details] (lw_shared_ptr<cql3::untyped_result_set> rs) mutable {
+            return f.then([trans = std::move(trans), &mutations, idx, tr_state, &details, squash_target] (lw_shared_ptr<cql3::untyped_result_set> rs) mutable {
                 auto& m = mutations[idx];
                 auto& s = m.schema();
 
@@ -1850,7 +1870,8 @@ cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, 
                 details.had_preimage |= preimage;
                 details.had_postimage |= postimage;
                 tracing::trace(tr_state, "CDC: Generating log mutations for {}", m.decorated_key());
-                if (should_split(m)) {
+                bool should_squash = squash_target == squash_target::insert || squash_target == squash_target::update;
+                if (should_split(m) && !should_squash) {
                     tracing::trace(tr_state, "CDC: Splitting {}", m.decorated_key());
                     details.was_split = true;
                     process_changes_with_splitting(m, trans, preimage, postimage);
@@ -1886,11 +1907,11 @@ bool cdc::cdc_service::needs_cdc_augmentation(const utils::chunked_vector<mutati
 }
 
 future<std::tuple<utils::chunked_vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>
-cdc::cdc_service::augment_mutation_call(lowres_clock::time_point timeout, utils::chunked_vector<mutation>&& mutations, tracing::trace_state_ptr tr_state, db::consistency_level write_cl) {
+cdc::cdc_service::augment_mutation_call(lowres_clock::time_point timeout, utils::chunked_vector<mutation>&& mutations, tracing::trace_state_ptr tr_state, db::consistency_level write_cl, squash_target squash_target) {
     if (utils::get_local_injector().enter("sleep_before_cdc_augmentation")) {
-        return seastar::sleep(std::chrono::milliseconds(100)).then([this, timeout, mutations = std::move(mutations), tr_state = std::move(tr_state), write_cl] () mutable {
-            return _impl->augment_mutation_call(timeout, std::move(mutations), std::move(tr_state), write_cl);
+        return seastar::sleep(std::chrono::milliseconds(100)).then([this, timeout, mutations = std::move(mutations), tr_state = std::move(tr_state), write_cl, squash_target] () mutable {
+            return _impl->augment_mutation_call(timeout, std::move(mutations), std::move(tr_state), write_cl, squash_target);
         });
     }
-    return _impl->augment_mutation_call(timeout, std::move(mutations), std::move(tr_state), write_cl);
+    return _impl->augment_mutation_call(timeout, std::move(mutations), std::move(tr_state), write_cl, squash_target);
 }

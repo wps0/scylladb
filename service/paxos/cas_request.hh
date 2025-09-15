@@ -9,6 +9,8 @@
 
 #include <optional>
 
+#include "cdc/log.hh"
+#include "mutation/mutation.hh"
 #include "timestamp.hh"
 #include <seastar/core/sharded.hh>
 
@@ -33,7 +35,7 @@ public:
     virtual ~cas_request() = default;
     // it is safe to dereference and use the qr foreign pointer, the result was
     // created by a foreign shard but no longer used by it.
-    virtual std::optional<mutation> apply(seastar::foreign_ptr<seastar::lw_shared_ptr<query::result>> qr,
+    virtual std::pair<std::optional<mutation>, cdc::squash_target> apply(seastar::foreign_ptr<seastar::lw_shared_ptr<query::result>> qr,
             const query::partition_slice& slice, api::timestamp_type ts) = 0;
 };
 

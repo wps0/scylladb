@@ -1459,10 +1459,10 @@ public:
     };
 
     // Steps of the Paxos protocol
-    future<ballot_and_data> begin_and_repair_paxos(client_state& cs, unsigned& contentions, bool is_write);
+    future<ballot_and_data> begin_and_repair_paxos(client_state& cs, unsigned& contentions, bool is_write, cdc::squash_target squash);
     future<paxos::prepare_summary> prepare_ballot(utils::UUID ballot);
     future<bool> accept_proposal(lw_shared_ptr<paxos::proposal> proposal, bool timeout_if_partially_accepted = true);
-    future<> learn_decision(lw_shared_ptr<paxos::proposal> proposal, bool allow_hints = false);
+    future<> learn_decision(lw_shared_ptr<paxos::proposal> proposal, cdc::squash_target squash = cdc::squash_target::no_squash, bool allow_hints = false);
     void prune(utils::UUID ballot);
     uint64_t id() const {
         return _id;
@@ -2054,7 +2054,7 @@ paxos_response_handler::~paxos_response_handler() {
  * nodes have seen the most recent commit. Otherwise, return null.
  */
 future<paxos_response_handler::ballot_and_data>
-paxos_response_handler::begin_and_repair_paxos(client_state& cs, unsigned& contentions, bool is_write) {
+paxos_response_handler::begin_and_repair_paxos(client_state& cs, unsigned& contentions, bool is_write, cdc::squash_target squash) {
     api::timestamp_type min_timestamp_micros_to_use = 0;
     auto _ = shared_from_this(); // hold the handler until co-routine ends
 
@@ -2112,7 +2112,7 @@ paxos_response_handler::begin_and_repair_paxos(client_state& cs, unsigned& conte
 
             if (is_accepted) {
                 try {
-                    co_await learn_decision(std::move(refreshed_in_progress), false);
+                    co_await learn_decision(std::move(refreshed_in_progress));
                     continue;
                 } catch (mutation_write_timeout_exception& e) {
                     e.type = db::write_type::CAS;
@@ -2491,7 +2491,7 @@ struct fmt::formatter<service::paxos_response_handler> : fmt::formatter<string_v
 namespace service {
 
 // This function implements learning stage of Paxos protocol
-future<> paxos_response_handler::learn_decision(lw_shared_ptr<paxos::proposal> decision, bool allow_hints) {
+future<> paxos_response_handler::learn_decision(lw_shared_ptr<paxos::proposal> decision, cdc::squash_target squash, bool allow_hints) {
     tracing::trace(tr_state, "learn_decision: committing {} with cl={}", *decision, _cl_for_learn);
     paxos::paxos_state::logger.trace("CAS[{}] learn_decision: committing {} with cl={}", _id, *decision, _cl_for_learn);
     // FIXME: allow_hints is ignored. Consider if we should follow it and remove if not.
@@ -2510,7 +2510,7 @@ future<> paxos_response_handler::learn_decision(lw_shared_ptr<paxos::proposal> d
         auto cdc = _proxy->get_cdc_service();
         if (cdc && cdc->needs_cdc_augmentation(update_mut_vec)) {
             auto cdc_shared = cdc->shared_from_this(); // keep CDC service alive
-            auto [all_mutations, tracker] = co_await cdc->augment_mutation_call(_timeout, std::move(update_mut_vec), tr_state, _cl_for_learn);
+            auto [all_mutations, tracker] = co_await cdc->augment_mutation_call(_timeout, std::move(update_mut_vec), tr_state, _cl_for_learn, squash);
             // Pick only the CDC ("augmenting") mutations
             auto mutations = all_mutations | std::views::filter([base_tbl_id] (const mutation& m) {
                 return m.schema()->id() != base_tbl_id;
@@ -6487,10 +6487,10 @@ storage_proxy::do_query_with_paxos(schema_ptr s,
 
     struct read_cas_request : public cas_request {
         foreign_ptr<lw_shared_ptr<query::result>> res;
-        std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr,
+        std::pair<std::optional<mutation>, cdc::squash_target> apply(foreign_ptr<lw_shared_ptr<query::result>> qr,
             const query::partition_slice& slice, api::timestamp_type ts) {
             res = std::move(qr);
-            return std::nullopt;
+            return {std::nullopt, cdc::squash_target::no_squash};
         }
     };
 
@@ -6630,6 +6630,7 @@ future<bool> storage_proxy::cas(schema_ptr schema, cas_shard cas_shard, shared_p
             }
         });
 
+        auto squash = cdc::squash_target::no_squash;
         auto l = co_await paxos::paxos_state::get_cas_lock(token, write_timeout);
 
         co_await utils::get_local_injector().inject("cas_timeout_after_lock", write_timeout + std::chrono::milliseconds(100));
@@ -6638,7 +6639,7 @@ future<bool> storage_proxy::cas(schema_ptr schema, cas_shard cas_shard, shared_p
             // Finish the previous PAXOS round, if any, and, as a side effect, compute
             // a ballot (round identifier) which is a) unique b) has good chances of being
             // recent enough.
-            auto [ballot, qr] = co_await handler->begin_and_repair_paxos(query_options.cstate, contentions, write);
+            auto [ballot, qr] = co_await handler->begin_and_repair_paxos(query_options.cstate, contentions, write, squash);
             // Read the current values and check they validate the conditions.
             if (qr) {
                 paxos::paxos_state::logger.debug("CAS[{}]: Using prefetched values for CAS precondition",
@@ -6655,7 +6656,8 @@ future<bool> storage_proxy::cas(schema_ptr schema, cas_shard cas_shard, shared_p
                 qr = std::move(cqr.query_result);
             }
 
-            auto mutation = request->apply(std::move(qr), cmd->slice, utils::UUID_gen::micros_timestamp(ballot));
+            auto [mutation, sq] = request->apply(std::move(qr), cmd->slice, utils::UUID_gen::micros_timestamp(ballot));
+            squash = sq;
             condition_met = true;
             if (!mutation) {
                 if (write) {
@@ -6685,7 +6687,7 @@ future<bool> storage_proxy::cas(schema_ptr schema, cas_shard cas_shard, shared_p
                 // accept the action associated with the computed ballot.
                 // Apply the mutation.
                 try {
-                  co_await handler->learn_decision(std::move(proposal));
+                  co_await handler->learn_decision(std::move(proposal), squash);
                 } catch (unavailable_exception& e) {
                     // if learning stage encountered unavailablity error lets re-map it to a write error
                     // since unavailable error means that operation has never ever started which is not

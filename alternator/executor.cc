@@ -2136,7 +2136,7 @@ public:
     put_or_delete_item(const rjson::value& item, schema_ptr schema, put_item, std::unordered_map<bytes, std::string> key_attributes);
     // put_or_delete_item doesn't keep a reference to schema (so it can be
     // moved between shards for LWT) so it needs to be given again to build():
-    mutation build(schema_ptr schema, api::timestamp_type ts, std::unique_ptr<rjson::value> previous_item, bool performed) const;
+    std::pair<mutation, cdc::squash_target> build(schema_ptr schema, api::timestamp_type ts, std::unique_ptr<rjson::value> previous_item, bool performed) const;
     const partition_key& pk() const { return _pk; }
     const clustering_key& ck() const { return _ck; }
     uint64_t length_in_bytes() const noexcept {
@@ -2280,7 +2280,7 @@ put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr sche
     }
 }
 
-mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, std::unique_ptr<rjson::value> previous_item, bool use_lwt) const {
+std::pair<mutation, cdc::squash_target> put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, std::unique_ptr<rjson::value> previous_item, bool use_lwt) const {
     mutation m(schema, _pk);
     // If there's no clustering key, a tombstone should be created directly
     // on a partition, not on a clustering row - otherwise it will look like
@@ -2288,19 +2288,14 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, st
     // Ref: #6035
     const bool use_partition_tombstone = schema->clustering_key_size() == 0;
     if (!_cells) {
-        // This shouldn't break consistency, as long as it's performed using
-        // lwt, because Scylla's Paxos guarantees linearizability.
-        if (use_lwt && !previous_item) {
-            // Ignore the delete.
-            return m;
-        }
+        auto squash = use_lwt && !previous_item ? cdc::squash_target::ignore_cdc : cdc::squash_target::no_squash;
         if (use_partition_tombstone) {
             m.partition().apply(tombstone(ts, gc_clock::now()));
         } else {
             // a DeleteItem operation:
             m.partition().clustered_row(*schema, _ck).apply(tombstone(ts, gc_clock::now()));
         }
-        return m;
+        return {m, squash};
     }
     // else, a PutItem operation:
     auto& row = m.partition().clustered_row(*schema, _ck);
@@ -2323,9 +2318,9 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, st
     // MODIFY Streams mutation, depending on whether the item previously existed, for better
     // compatibility of with DynamoDB Streams. This resolves #6918.
     elogger.debug("performed={} previous_item={}", use_lwt, (bool) previous_item);
-    if (!use_lwt || !previous_item) {
-        row.apply(row_marker(ts));
-    }
+    // if (!use_lwt || !previous_item) {
+    row.apply(row_marker(ts));
+    // }
     // PutItem is supposed to completely replace the old item, so we need to
     // also have a tombstone removing old cells. Important points:
     // 1) Alternator's schema is dynamic, therefore we store data in a map
@@ -2346,7 +2341,33 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts, st
             row.cells().apply(cdef, atomic_cell::make_dead(ts - 1, gc_clock::now()));
         }
     }
-    return m;
+    auto squash = previous_item ? cdc::squash_target::update : cdc::squash_target::insert;
+
+    // auto cell_attrs = std::find_if(_cells->begin(), _cells->end(), [](auto& c) {
+    //     return std::strcmp(reinterpret_cast<const char*>(c.column_name.c_str()), executor::ATTRS_COLUMN_NAME) == 0;
+    // });
+    // auto xd = previous_item->FindMember(executor::ATTRS_COLUMN_NAME);
+    // if ((xd == previous_item->MemberEnd() && cell_attrs == _cells->end()) || (xd != previous_item->MemberEnd() && cell_attrs != _cells->end())) {
+    //     if (cell_attrs == _cells->end()) {
+    //         if (previous_item) {
+    //             squash = cdc::squash_target::ignore_cdc;
+    //         }
+    //     } else {
+    //         auto xd2 = *xd;
+    //         auto item = rjson::empty_object();
+    //         auto deserialized = attrs_type()->deserialize(cell_attrs->value);
+    //         auto keys_and_values = value_cast<map_type_impl::native_type>(deserialized);
+    //         for (auto entry : keys_and_values) {
+    //             std::string attr_name = value_cast<sstring>(entry.first);
+    //                 bytes value = value_cast<bytes>(entry.second);
+    //                 rjson::value v = deserialize_item(value);
+    //                 auto exi = xd2.value.FindMember(attr_name);
+    //                 rjson::add_with_string_name(item, attr_name, std::move(v));
+    //         }
+    //     }
+    // }
+
+    return {m, squash};
 }
 
 // The DynamoDB API doesn't let the client control the server's timeout, so
@@ -2445,7 +2466,7 @@ rmw_operation::rmw_operation(service::storage_proxy& proxy, rjson::value&& reque
     // the request).
 }
 
-std::optional<mutation> rmw_operation::apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts) {
+std::pair<std::optional<mutation>, cdc::squash_target> rmw_operation::apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts) {
     if (qr->row_count()) {
         auto selection = cql3::selection::selection::wildcard(_schema);
         uint64_t item_length = 0;
@@ -2592,7 +2613,7 @@ future<executor::request_return_type> rmw_operation::execute(service::storage_pr
             // a read, then a write. TODO: remove this mode entirely.
             return get_previous_item(proxy, client_state, schema(), _pk, _ck, permit, global_stats, per_table_stats, _consumed_capacity._total_bytes).then(
                     [this, &proxy, &wcu_total, trace_state, permit = std::move(permit)] (std::unique_ptr<rjson::value> previous_item) mutable {
-                std::optional<mutation> m = apply(std::move(previous_item), false, api::new_timestamp());
+                auto [m, _] = apply(std::move(previous_item), false, api::new_timestamp());
                 if (!m) {
                     return make_ready_future<executor::request_return_type>(api_error::conditional_check_failed("The conditional request failed", std::move(_return_attributes)));
                 }
@@ -2603,7 +2624,7 @@ future<executor::request_return_type> rmw_operation::execute(service::storage_pr
         }
     } else if (_write_isolation != write_isolation::LWT_ALWAYS) {
         elogger.trace("siema write isolation != lwt always");
-        std::optional<mutation> m = apply(nullptr, false, api::new_timestamp());
+        auto [m, _] = apply(nullptr, false, api::new_timestamp());
         SCYLLA_ASSERT(m); // !needs_read_before_write, so apply() did not check a condition
         return proxy.mutate(utils::chunked_vector<mutation>{std::move(*m)}, db::consistency_level::LOCAL_QUORUM, executor::default_timeout(), trace_state, std::move(permit), db::allow_per_partition_rate_limit::yes).then([this, &wcu_total] () mutable {
             return rmw_operation_return(std::move(_return_attributes), _consumed_capacity, wcu_total);
@@ -2713,7 +2734,7 @@ public:
                check_needs_read_before_write(_condition_expression) ||
                _returnvalues == returnvalues::ALL_OLD;
     }
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const override {
+    virtual std::pair<std::optional<mutation>, cdc::squash_target> apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const override {
         if (!verify_expected(_request, previous_item.get()) ||
             !verify_condition_expression(_condition_expression, previous_item.get())) {
             if (previous_item && _returnvalues_on_condition_check_failure ==
@@ -2812,7 +2833,7 @@ public:
                 check_needs_read_before_write(_condition_expression) ||
                 _returnvalues == returnvalues::ALL_OLD;
     }
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const override {
+    virtual std::pair<std::optional<mutation>, cdc::squash_target> apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const override {
         if (!verify_expected(_request, previous_item.get()) ||
             !verify_condition_expression(_condition_expression, previous_item.get())) {
             if (previous_item && _returnvalues_on_condition_check_failure ==
@@ -2832,6 +2853,7 @@ public:
         if (_consumed_capacity._total_bytes == 0) {
             _consumed_capacity._total_bytes = 1;
         }
+        elogger.trace("siema delete apply previous_item={} performed_read={}", (bool) previous_item, performed_read);
         return _mutation_builder.build(_schema, ts, std::move(previous_item), performed_read);
     }
     virtual ~delete_item_operation() = default;
@@ -2916,17 +2938,17 @@ public:
     put_or_delete_item_cas_request(schema_ptr s, std::vector<put_or_delete_item>&& b) :
         schema(std::move(s)), _mutation_builders(std::move(b)) { }
     virtual ~put_or_delete_item_cas_request() = default;
-    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts) override {
+    virtual std::pair<std::optional<mutation>, cdc::squash_target> apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts) override {
         std::optional<mutation> ret;
         for (const put_or_delete_item& mutation_builder : _mutation_builders) {
             // We assume all these builders have the same partition.
             if (ret) {
-                ret->apply(mutation_builder.build(schema, ts, nullptr, false));
+                ret->apply(mutation_builder.build(schema, ts, nullptr, false).first);
             } else {
-                ret = mutation_builder.build(schema, ts, nullptr, false);
+                ret = mutation_builder.build(schema, ts, nullptr, false).first;
             }
         }
-        return ret;
+        return {ret, cdc::squash_target::no_squash};
     }
 };
 
@@ -2984,7 +3006,7 @@ static future<> do_batch_write(service::storage_proxy& proxy,
         mutations.reserve(mutation_builders.size());
         api::timestamp_type now = api::new_timestamp();
         for (auto& b : mutation_builders) {
-            mutations.push_back(b.second.build(b.first, now, nullptr, false));
+            mutations.push_back(b.second.build(b.first, now, nullptr, false).first);
         }
         return proxy.mutate(std::move(mutations),
                 db::consistency_level::LOCAL_QUORUM,
@@ -3709,7 +3731,7 @@ public:
 
     update_item_operation(service::storage_proxy& proxy, rjson::value&& request);
     virtual ~update_item_operation() = default;
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const override;
+    virtual std::pair<std::optional<mutation>, cdc::squash_target> apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const override;
     bool needs_read_before_write() const;
 };
 
@@ -4034,8 +4056,9 @@ static bool hierarchy_actions(
     return true;
 }
 
-std::optional<mutation>
+std::pair<std::optional<mutation>, cdc::squash_target>
 update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, bool performed_read, api::timestamp_type ts) const {
+    auto squash = !performed_read || !previous_item ? cdc::squash_target::insert : cdc::squash_target::update;
     if (_consumed_capacity._total_bytes == 0) {
         _consumed_capacity._total_bytes = 1;
     }
@@ -4311,7 +4334,9 @@ update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, bool p
         }
     }
 
-    return m;
+    elogger.trace("performed_read = {}, previous_item = {}", performed_read, (bool)previous_item);
+
+    return {m, squash};
 }
 
 future<executor::request_return_type> executor::update_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {

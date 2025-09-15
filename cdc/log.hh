@@ -55,6 +55,10 @@ struct operation_result_tracker;
 class db_context;
 class metadata;
 
+enum class squash_target : int8_t {
+    ignore_cdc = -1, no_squash = 0, update = 1, insert = 2
+};
+
 bool is_log_name(const std::string_view& table_name);
 
 /// \brief CDC service, responsible for schema listeners
@@ -79,7 +83,8 @@ public:
         lowres_clock::time_point timeout,
         utils::chunked_vector<mutation>&& mutations,
         tracing::trace_state_ptr tr_state,
-        db::consistency_level write_cl
+        db::consistency_level write_cl,
+        squash_target squash_target = squash_target::no_squash
         );
     bool needs_cdc_augmentation(const utils::chunked_vector<mutation>&) const;
 };

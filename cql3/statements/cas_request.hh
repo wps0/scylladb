@@ -66,7 +66,7 @@ public:
     void add_row_update(const modification_statement& stmt_arg, std::vector<query::clustering_range> ranges_arg,
         modification_statement::json_cache_opt json_cache_arg, const query_options& options_arg);
 
-    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr,
+    virtual std::pair<std::optional<mutation>, cdc::squash_target> apply(foreign_ptr<lw_shared_ptr<query::result>> qr,
             const query::partition_slice& slice, api::timestamp_type ts) override;
 
     /// Build a result set with prefetched rows, but return only
